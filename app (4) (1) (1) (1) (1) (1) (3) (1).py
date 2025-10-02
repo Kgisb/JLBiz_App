@@ -8871,6 +8871,7 @@ elif view == "Daily Business":
 # =========================
 # =========================
 # =========================
+# =========================
 # Business Projection (no sklearn; excludes current month from training; adds MTD vs Projected chart)
 # =========================
 elif view == "Business Projection":
@@ -8942,17 +8943,18 @@ elif view == "Business Projection":
 
         # Ensure continuous monthly index
         full_idx = pd.period_range(start=y_full.index.min(), end=max(y_full.index.max(), pd.Period(date.today(), freq="M")), freq="M")
-        y_full = y_full.reindex(full_idx, fill_value=0)
+        y_full = y_full.reindex(full_idx, fill_value=0).sort_index()
 
         # Split history vs current
         cur_per   = pd.Period(date.today(), freq="M")
         last_comp = cur_per - 1  # last complete month
-        y_hist    = y_full.loc[:last_comp]  # strictly excludes current month
+        y_hist    = y_full.loc[:last_comp].copy()  # strictly excludes current month
         y_current_mtd = int((dfp["_P"].dt.to_period("M") == cur_per).sum())  # actual MTD count
 
         # ---------- Helpers (design, ridge, holt-winters, naive) ----------
         def build_design(y_ser: pd.Series, max_lag: int):
             """Return X (lags + month dummies) and y (aligned), dropping initial NaNs."""
+            y_ser = y_ser.sort_index()
             dfX = pd.DataFrame({"y": y_ser.astype(float)})
             for L in range(1, max_lag+1):
                 dfX[f"lag_{L}"] = dfX["y"].shift(L)
@@ -8976,26 +8978,43 @@ elif view == "Business Projection":
             return yhat
 
         def ridge_forecast_iterative(y_series: pd.Series, tgt: pd.Period, max_lag: int, alpha=2.0):
-            """Iteratively forecast month-by-month from last_comp+1 to target, refitting each step; training never includes the month being predicted."""
-            y_work = y_series.copy()  # this must exclude current month already
+            """
+            Iteratively forecast month-by-month from the month after y_series.index.max() up to `tgt`.
+            For each step:
+              • create the step in the series with a temporary 0 (so design has a row),
+              • train only on rows < step,
+              • predict the step and overwrite that exact row (no concat).
+            This keeps the PeriodIndex unique and avoids Series-to-float errors.
+            """
+            y_work = y_series.sort_index().astype(float).copy()
             step = y_work.index.max() + 1
             while step <= tgt:
-                # build design on y_work (history to last_comp or appended preds)
+                # Ensure 'step' exists exactly once with a placeholder 0.0
+                if step not in y_work.index:
+                    new_idx = pd.period_range(y_work.index.min(), step, freq="M")
+                    y_work = y_work.reindex(new_idx)
+                    y_work.loc[step] = 0.0  # placeholder (will be excluded from training but used as feature row)
+                y_work = y_work.sort_index()
+
+                # Build design on the whole (placeholder keeps row present for features)
                 X_all, y_all = build_design(y_work, max_lag=max_lag)
+
+                # Exclude the step from training; use the step row only for prediction features
                 if step not in X_all.index:
-                    # extend with zeros to create row for design alignment
-                    y_work = y_work.reindex(pd.period_range(y_work.index.min(), step, freq="M"), fill_value=0.0)
-                    X_all, y_all = build_design(y_work, max_lag=max_lag)
-                train_mask = X_all.index < step   # exclude step
-                if train_mask.sum() < max(8, max_lag + 4):
-                    # not enough rows; fallback to simple naive
+                    # Not enough lags yet; fallback to recent mean
                     next_val = float(y_work.iloc[-min(12, len(y_work)):].mean())
                 else:
-                    next_val = float(ridge_fit_predict(X_all.loc[train_mask], y_all.loc[train_mask], X_all.loc[[step]], alpha=alpha)[0])
-                next_val = max(0.0, next_val)
-                # append forecast into series
-                y_work = pd.concat([y_work, pd.Series([next_val], index=[step])])
+                    train_mask = X_all.index < step
+                    if train_mask.sum() < max(8, max_lag + 4):
+                        next_val = float(y_work.iloc[-min(12, len(y_work)):].mean())
+                    else:
+                        yhat = ridge_fit_predict(X_all.loc[train_mask], y_all.loc[train_mask], X_all.loc[[step]], alpha=alpha)[0]
+                        next_val = float(max(0.0, yhat))
+
+                # Overwrite the placeholder with the forecast (no concat → no duplicates)
+                y_work.loc[step] = next_val
                 step += 1
+
             return float(y_work.loc[tgt])
 
         def holt_winters_additive(y_series: pd.Series, season_len=12, alphas=(0.2,0.4,0.6,0.8), betas=(0.1,0.2), gammas=(0.1,0.2)):
@@ -9051,11 +9070,12 @@ elif view == "Business Projection":
             return float(L + T + S[s_idx_next])
 
         def holt_winters_iterative(y_series: pd.Series, tgt: pd.Period, season_len=12):
-            y_work = y_series.copy()
+            y_work = y_series.sort_index().copy()
             while y_work.index.max() < tgt:
                 fit, params = holt_winters_additive(y_work, season_len=season_len)
                 nxt = holt_winters_forecast_next(y_work, season_len=season_len, params=params)
-                y_work = pd.concat([y_work, pd.Series([max(0.0, float(nxt))], index=[y_work.index.max()+1])])
+                y_work.loc[y_work.index.max() + 1] = max(0.0, float(nxt))
+                y_work = y_work.sort_index()
             return float(y_work.loc[tgt])
 
         def naive_seasonal_forecast(y_series: pd.Series, target_per):
@@ -9069,10 +9089,11 @@ elif view == "Business Projection":
             return 0.7 * sm_mean + 0.3 * recent_mean
 
         def naive_iterative(y_series: pd.Series, tgt: pd.Period):
-            y_work = y_series.copy()
+            y_work = y_series.sort_index().copy()
             while y_work.index.max() < tgt:
                 nxt = naive_seasonal_forecast(y_work, y_work.index.max()+1)
-                y_work = pd.concat([y_work, pd.Series([max(0.0, float(nxt))], index=[y_work.index.max()+1])])
+                y_work.loc[y_work.index.max() + 1] = max(0.0, float(nxt))
+                y_work = y_work.sort_index()
             return float(y_work.loc[tgt])
 
         # ---------- Backtest (rolling-origin) to compute Accuracy % (uses y_hist) ----------
@@ -9085,8 +9106,8 @@ elif view == "Business Projection":
         if model_name.startswith("Ridge"):
             # backtest: 1-step ahead, training up to t-1 (all strictly <= last complete month)
             for t in y_bt.index:
-                y_tr = y_hist.loc[:(t - 1)]
-                if len(y_tr) < max(8, max_lag + 4): 
+                y_tr = y_hist.loc[:(t - 1)].copy()
+                if len(y_tr) < max(8, max_lag + 4):
                     continue
                 yhat = ridge_forecast_iterative(y_tr, t, max_lag=max_lag, alpha=2.0)
                 preds_bt.append(max(0.0, float(yhat)))
@@ -9095,8 +9116,8 @@ elif view == "Business Projection":
 
         elif model_name.startswith("Holt-Winters"):
             for t in y_bt.index:
-                y_tr = y_hist.loc[:(t - 1)]
-                if len(y_tr) < 18: 
+                y_tr = y_hist.loc[:(t - 1)].copy()
+                if len(y_tr) < 18:
                     continue
                 yhat = holt_winters_iterative(y_tr, t, season_len=12)
                 preds_bt.append(max(0.0, float(yhat)))
@@ -9105,7 +9126,7 @@ elif view == "Business Projection":
 
         else:  # Naive Seasonal
             for t in y_bt.index:
-                y_tr = y_hist.loc[:(t - 1)]
+                y_tr = y_hist.loc[:(t - 1)].copy()
                 if len(y_tr) < 6:
                     continue
                 yhat = naive_iterative(y_tr, t)
@@ -9168,7 +9189,6 @@ elif view == "Business Projection":
 
         # ---------- Running month: Actual vs Projected ----------
         st.markdown("### Running Month — Actual vs Projected")
-        # Project month-end for current month using the chosen model, trained only on y_hist
         proj_cur = None
         if model_name.startswith("Ridge"):
             if len(y_hist) >= max(8, max_lag + 4):
@@ -9190,7 +9210,6 @@ elif view == "Business Projection":
             with k3:
                 st.metric("Projected Remaining", f"{remain:.1f}")
 
-            # Mini bar chart
             small_df = pd.DataFrame({
                 "Metric": ["Actual MTD", "Projected Month-End"],
                 "Count":  [float(y_current_mtd), float(proj_cur)]
@@ -9314,6 +9333,5 @@ elif view == "Business Projection":
 
     # run it
     _business_projection_tab()
-
 
 
