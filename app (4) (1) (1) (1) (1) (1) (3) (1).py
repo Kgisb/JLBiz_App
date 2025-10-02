@@ -7788,7 +7788,8 @@ elif view == "Marketing Lead Performance & Requirement":
 
     _mlpr_tab()
 # =========================
-# Funnel Tab (comprehensive time/dimension funnel with derived rates & Pre-Book split)
+# =========================
+# Funnel Tab (fixed Cohort filtering for current month)
 # =========================
 elif view == "Funnel":
     def _funnel_tab():
@@ -7826,7 +7827,7 @@ elif view == "Funnel":
             mode = st.radio(
                 "Mode", ["MTD", "Cohort"], index=0, horizontal=True, key="fn_mode",
                 help=("MTD: count events only when the deal was also created in that same period.\n"
-                      "Cohort: count events by their own date (create date can be anywhere).")
+                      "Cohort: count events by their own date (creation can be anywhere).")
             )
         with c1:
             gran = st.radio("Granularity", ["Day", "Week", "Month", "Year"], index=2, horizontal=True, key="fn_gran")
@@ -7894,41 +7895,34 @@ elif view == "Funnel":
         X_cns     = norm_cat(df_f[_cns]) if _cns else pd.Series("Unknown", index=df_f.index)
         X_src     = norm_cat(df_f[_src]) if _src else pd.Series("Unknown", index=df_f.index)
 
-        # Population by Create Date range (denominator universe & period slicing)
-        in_create_window = C_date.notna() & (C_date >= create_start) & (C_date <= create_end)
+        # Helper: between for dates
+        def _between(dates, a, b):
+            return dates.notna() & (dates >= a) & (dates <= b)
+
+        # Population by Create Date range (for MTD universe and for "Leads" metric)
+        in_create_window = _between(C_date, create_start, create_end)
 
         # ---------- Period key based on granularity ----------
         def period_key(dt_series):
             dts = pd.to_datetime(dt_series, errors="coerce")
             if gran == "Day":
-                return dts.dt.date.astype("datetime64[ns]")  # day as timestamp
+                return dts.dt.floor("D")
             if gran == "Week":
                 # ISO week start (Mon)
-                return (dts - pd.to_timedelta(dts.dt.weekday, unit="D")).dt.date.astype("datetime64[ns]")
+                return (dts - pd.to_timedelta(dts.dt.weekday, unit="D")).dt.floor("D")
             if gran == "Month":
                 return dts.dt.to_period("M").dt.to_timestamp()
             if gran == "Year":
                 return dts.dt.to_period("Y").dt.to_timestamp()
             return dts.dt.to_period("M").dt.to_timestamp()
 
-        # ---------- Build rows per metric ----------
-        # Base mask for booking filter
-        if booking_filter == "Pre-Book only":
-            mask_booking = pre_book
-        elif booking_filter == "Sales-Book only":
-            mask_booking = ~pre_book
-        else:
-            mask_booking = pd.Series(True, index=df_f.index)
-
-        # Per-metric inclusion (MTD vs Cohort) within the *create range*
-        # We'll aggregate by the event's own period key (and for MTD also require: same period as creation)
+        # ---------- Build masks (FIX: Cohort uses each event's own date window) ----------
         per_create = period_key(C)
         per_pay    = period_key(P)
         per_first  = period_key(F)
         per_resch  = period_key(R)
         per_done   = period_key(D)
 
-        # Helper: same-period (for MTD) check
         same_period_pay   = (per_create == per_pay)
         same_period_first = (per_create == per_first)
         same_period_resch = (per_create == per_resch)
@@ -7936,18 +7930,28 @@ elif view == "Funnel":
 
         # Masks for each event series
         m_created = in_create_window & C.notna()
+
         if mode == "MTD":
+            # Event must exist, creation within window, and event in the SAME period as creation
             m_enrol = in_create_window & P.notna() & same_period_pay
             m_first = in_create_window & F.notna() & same_period_first
             m_resch = in_create_window & R.notna() & same_period_resch
             m_done  = in_create_window & D.notna() & same_period_done
         else:
-            m_enrol = P.notna() & in_create_window  # Cohort: created in window, counted by payment period (create month may differ but still within window population)
-            m_first = F.notna() & in_create_window
-            m_resch = R.notna() & in_create_window
-            m_done  = D.notna() & in_create_window
+            # COHORT FIX: count events by THEIR OWN DATE between start/end, regardless of create month
+            m_enrol = _between(P_date, create_start, create_end) & P.notna()
+            m_first = _between(F_date, create_start, create_end) & F.notna()
+            m_resch = _between(R_date, create_start, create_end) & R.notna()
+            m_done  = _between(D_date, create_start, create_end) & D.notna()
 
         # Apply booking filter
+        if booking_filter == "Pre-Book only":
+            mask_booking = pre_book
+        elif booking_filter == "Sales-Book only":
+            mask_booking = ~pre_book
+        else:
+            mask_booking = pd.Series(True, index=df_f.index)
+
         m_created &= mask_booking
         m_enrol   &= mask_booking
         m_first   &= mask_booking
@@ -8034,7 +8038,6 @@ elif view == "Funnel":
 
         # Sort keys
         if x_dim == "Time":
-            # Ensure temporal sort
             grid["__sort"] = pd.to_datetime(grid["Period"])
             grid = grid.sort_values("__sort").drop(columns="__sort")
         else:
@@ -8053,7 +8056,6 @@ elif view == "Funnel":
             return
 
         # ---- Graph mode ----
-        # Special case: Combo chart (Leads bar + Enrolments line) only when x_dim == Time and those two metrics chosen.
         if chart_type.startswith("Combo"):
             if x_dim != "Time":
                 st.info("Combo chart is available only for Time on X-axis. Showing standard chart instead.")
@@ -8062,11 +8064,10 @@ elif view == "Funnel":
             else:
                 g = grid.copy()
                 base_enc = [
-                    alt.X("Period:T", title=X_label),
+                    alt.X("Period:T", title="Period"),
                     alt.Tooltip("yearmonthdate(Period):T", title="Period")
                 ]
                 if color_field:
-                    # facet by Booking Type to keep combo readable
                     created_bar = (
                         alt.Chart(g)
                         .mark_bar(opacity=0.85)
@@ -8087,20 +8088,19 @@ elif view == "Funnel":
                 else:
                     created_bar = (
                         alt.Chart(g).mark_bar(opacity=0.85)
-                        .encode(alt.X("Period:T", title=X_label),
+                        .encode(alt.X("Period:T", title="Period"),
                                 alt.Y("Deals Created:Q", title="Deals Created"),
                                 tooltip=[alt.Tooltip("yearmonthdate(Period):T", title="Period"),
                                          alt.Tooltip("Deals Created:Q", format="d")])
                     )
                     enrol_line = (
                         alt.Chart(g).mark_line(point=True)
-                        .encode(alt.X("Period:T", title=X_label),
+                        .encode(alt.X("Period:T", title="Period"),
                                 alt.Y("Enrolments:Q", title="Enrolments"),
                                 tooltip=[alt.Tooltip("yearmonthdate(Period):T", title="Period"),
                                          alt.Tooltip("Enrolments:Q", format="d")])
                     )
                     st.altair_chart(created_bar + enrol_line, use_container_width=True)
-                # Also let them download the underlying grid
                 st.download_button(
                     "Download CSV — Combo data",
                     grid.to_csv(index=False).encode("utf-8"),
@@ -8111,71 +8111,59 @@ elif view == "Funnel":
 
         # General chart
         g = grid.copy()
-        # Build tidy for chosen metrics
-        melt_cols = metrics_pick
         tidy = g.melt(
             id_vars=group_fields + ([color_field] if color_field else []),
-            value_vars=melt_cols,
+            value_vars=metrics_pick,
             var_name="Metric",
             value_name="Value"
         )
 
-        # Decide encoding types
         if x_dim == "Time":
-            x_enc = alt.X("Period:T", title=X_label)
+            x_enc = alt.X("Period:T", title="Period")
             tooltip_x = alt.Tooltip("yearmonthdate(Period):T", title="Period")
         else:
-            x_enc = alt.X(f"{group_fields[0]}:N", title=X_label, sort=sorted(tidy[group_fields[0]].dropna().unique()))
-            tooltip_x = alt.Tooltip(f"{group_fields[0]}:N", title=X_label)
+            x_enc = alt.X(f"{group_fields[0]}:N", title=group_fields[0], sort=sorted(tidy[group_fields[0]].dropna().unique()))
+            tooltip_x = alt.Tooltip(f"{group_fields[0]}:N", title=group_fields[0])
 
-        # If values are percentages, format accordingly
         any_pct = any(s.endswith("%") for s in metrics_pick)
         y_title = "Value (count)" if not any_pct else "Value"
         y_enc = alt.Y("Value:Q", title=y_title)
 
-        # Color: by Metric normally; if stacking booking type, we facet by Metric to keep readability
         if chart_type == "Stacked Bar":
             if color_field:
-                # stack booking type, facet by metric
                 ch = (
                     alt.Chart(tidy)
                     .mark_bar(opacity=0.9)
                     .encode(
-                        x=x_enc,
-                        y=y_enc,
+                        x=x_enc, y=y_enc,
                         color=alt.Color(f"{color_field}:N", title="Booking Type"),
                         column=alt.Column("Metric:N", title="Metric"),
                         tooltip=[tooltip_x,
                                  alt.Tooltip(f"{(color_field or 'Metric')}:N"),
                                  alt.Tooltip("Metric:N"),
                                  alt.Tooltip("Value:Q", format=".1f" if any_pct else "d")]
-                    )
-                    .properties(height=320)
+                    ).properties(height=320)
                 )
             else:
                 ch = (
-                    alt.Chart(tidy)
-                    .mark_bar(opacity=0.9)
+                    alt.Chart(tidy).mark_bar(opacity=0.9)
                     .encode(
-                        x=x_enc,
-                        y=y_enc,
+                        x=x_enc, y=y_enc,
                         color=alt.Color("Metric:N", title="Metric", legend=alt.Legend(orient="bottom")),
-                        tooltip=[tooltip_x, alt.Tooltip("Metric:N"), alt.Tooltip("Value:Q", format=".1f" if any_pct else "d")]
-                    )
-                    .properties(height=360)
+                        tooltip=[tooltip_x, alt.Tooltip("Metric:N"),
+                                 alt.Tooltip("Value:Q", format=".1f" if any_pct else "d")]
+                    ).properties(height=360)
                 )
         else:
             mark = {"Bar":"bar","Line":"line","Area":"area"}.get(chart_type, "bar")
             if color_field:
-                # facet by Metric, color booking type
                 ch = (
                     alt.Chart(tidy)
                     .mark_line(point=True) if mark=="line" else
                     alt.Chart(tidy).mark_area(opacity=0.5) if mark=="area" else
                     alt.Chart(tidy).mark_bar(opacity=0.9)
                 ).encode(
-                    x=x_enc,
-                    y=y_enc,
+                    x=x_enc, y=y_enc,
                     color=alt.Color(f"{color_field}:N", title="Booking Type", legend=alt.Legend(orient="bottom")),
                     column=alt.Column("Metric:N", title="Metric"),
                     tooltip=[tooltip_x, alt.Tooltip(f"{color_field}:N"), alt.Tooltip("Metric:N"),
@@ -8188,8 +8176,7 @@ elif view == "Funnel":
                     alt.Chart(tidy).mark_area(opacity=0.5) if mark=="area" else
                     alt.Chart(tidy).mark_bar(opacity=0.9)
                 ).encode(
-                    x=x_enc,
-                    y=y_enc,
+                    x=x_enc, y=y_enc,
                     color=alt.Color("Metric:N", legend=alt.Legend(orient="bottom")),
                     tooltip=[tooltip_x, alt.Tooltip("Metric:N"),
                              alt.Tooltip("Value:Q", format=".1f" if any_pct else "d")]
@@ -8207,6 +8194,7 @@ elif view == "Funnel":
 
     # run it
     _funnel_tab()
+
 # =========================
 # Master Graph – flexible chart builder (single / combined / ratio)
 # =========================
